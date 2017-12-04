@@ -1,0 +1,619 @@
+---
+title: "Using machine learning to dicriminate lncRNA and protein coding transcripts"
+output: html_document
+---
+
+## An example using R and caret{.tabset}
+
+### Step 0. Setup
+
+I've pre-made a dataset of lncRNA and protein coding transcripts from Gencodev27. 
+The code to recreate it is [here](https://github.com/betsig/ML_caret_example/blob/master/create_lncRNA_pcRNA_dataset.R), but because it can take a while to extract features for each transcript, you can download it from [here](https://www.dropbox.com/s/8lxgmx9ojggdqv8/lncRNA_v_pcRNA.csv?dl=0).
+
+
+First, load the packages you'll need for later steps, and set up your environment
+```{r setup, echo=TRUE}
+library(caret)
+library(PRROC)
+library(ggplot2)
+library(pheatmap)
+
+options(stringsAsFactors = FALSE)
+options(warn = -1)
+```
+
+Next, read in the data
+```{r, echo=TRUE}
+lncRNAandpcRNA <- read.csv('lncRNA_v_pcRNA.csv')
+head(lncRNAandpcRNA)
+```
+
+### Step 1: Data preprocesing
+
+Create dummy variables so all your variables are now numeric
+```{r, echo=TRUE}
+# create dummy variables
+dummies <- caret::dummyVars(set ~. , lncRNAandpcRNA)
+# convert to dummy variables
+all_data_numeric <- predict(dummies, newdata = lncRNAandpcRNA)
+# original discrete variable
+head(lncRNAandpcRNA[,c(22, grep("first_nt", colnames(lncRNAandpcRNA)))])
+# new numeric variables
+head(all_data_numeric[,grep("first_nt", colnames(all_data_numeric))])
+```
+
+Find any variables with near zero variance and remove them
+```{r}
+# find any variables with near zero variance
+nzv <- nearZeroVar(all_data_numeric, saveMetrics=TRUE)
+# in our case, there are none
+if(any(nzv$nzv)){
+  all_data_numeric <- all_data_numeric[,-which(nzv$nzv)]
+}
+```
+
+Find any variable correlations and remove them
+```{r}
+# find any correlated variables
+variable_correlations <- cor(all_data_numeric)
+# heatmap of variable correlations
+pheatmap(variable_correlations, cluster_rows = F, cluster_cols = F)
+
+# find correlations which are greater than 99%
+highly_correlated <- findCorrelation(variable_correlations, cutoff = .99)
+
+# we have 3 variables highly correlated to another
+# in all these cases, it's nt lengths correlated to AA lengths (by definition, nt length = 3x AA length)
+# e.g. seq_length_nt is correlated to seq_length (in AA) - as expected it's 3x translated AA length
+pheatmap(variable_correlations[highly_correlated,], cluster_rows = F, cluster_cols = F)
+
+# remove these variables
+all_data_numeric <- all_data_numeric[,-highly_correlated]
+```
+
+### Step 2: Data splitting, centering and scaling
+
+We need to split up our data into 3 sets - training, testing and validation
+
+```{r, echo=TRUE}
+# set seed so this is reproducable 
+set.seed(1)
+
+# reorder our rows randomly 
+random_order_pcRNA <- sample(which(lncRNAandpcRNA$set == "pcRNA"))
+random_order_lncRNA <- sample(which(lncRNAandpcRNA$set == "lncRNA"))
+
+# get indicies for balanced datasets (2000 in each set, at a 1:1 ratio)
+inTrain <- c(random_order_pcRNA[1:1000], random_order_lncRNA[1:1000])
+inValidate <- c(random_order_pcRNA[1001:2000], random_order_lncRNA[1001:2000])
+inTest <- c(random_order_pcRNA[2001:3000], random_order_lncRNA[2001:3000])
+
+# split our numeric data
+training <- all_data_numeric[inTrain,]
+validate <- all_data_numeric[inValidate,]
+testing <- all_data_numeric[inTest,]
+```
+
+Center and scale our data
+```{r}
+# center and scale each dataset by the training values
+preProcessValues <- preProcess(training, method=c("center", "scale"))
+training <- predict(preProcessValues, training)
+validate <- predict(preProcessValues, validate)
+testing <- predict(preProcessValues, testing)
+
+# add classes
+train_class <- lncRNAandpcRNA$set[inTrain]
+validate_class <- lncRNAandpcRNA$set[inValidate]
+test_class <- lncRNAandpcRNA$set[inTest]
+
+training <- cbind(as.data.frame(training), set=train_class)
+validate <- cbind(as.data.frame(validate), set=validate_class)
+testing <- cbind(as.data.frame(testing), set=test_class)
+```
+
+### Step 3: Model training {.tabset}
+
+#### Part 1: Train with a selection of model algorithms {.tabset}
+
+We're going to train 5 different model types.
+```{r, echo=TRUE}
+# create a cross-validation control object
+fitControl <- trainControl(## 10-fold CV
+  method = "repeatedcv",
+  number = 10, # 10 folds
+  repeats = 3, # repeated 3 times
+  classProbs = TRUE # allows us to get probabilities for class predictions
+  )
+
+# Random Forest (takes a while...)
+randomForestModel <- train(set ~ ., 
+                      data=training, 
+                      method="rf",
+                      trControl = fitControl, 
+                      verbose=FALSE)
+
+# gradient boosting ensemble
+boostModel <- train(set ~ ., 
+                     data=training, 
+                     method="gbm",
+                     verbose=FALSE, # be quiet
+                     trControl = fitControl)
+
+# generalised linear model
+linearModel <- train(set ~ ., 
+                    data=training, 
+                    method="glm",
+                    trControl = fitControl)
+# CART tree
+treeModel <- train(set ~ ., 
+                     data=training, 
+                     method="rpart",
+                     trControl = fitControl)
+
+# Support Vector Machine (with rbf kernal)
+svmModel <- train(set ~ ., 
+                   data=training, 
+                   method="svmRadial",
+                   trControl = fitControl)
+```
+
+Next, we want to see how well each of these models performs on our testing data.
+```{r}
+# get each model to predict classes on our testing dataset
+p_rF <- predict(randomForestModel, testing)
+p_l <- predict(linearModel, testing)
+p_b <- predict(boostModel, testing)
+p_t <- predict(treeModel, testing)
+p_s <- predict(svmModel, testing)
+
+# calulcate performance metrics with confusion matrices
+cf_rF <- confusionMatrix(p_rF,testing$set)
+cf_l <- confusionMatrix(p_l,testing$set)
+cf_b <- confusionMatrix(p_b,testing$set)
+cf_t <- confusionMatrix(p_t,testing$set)
+cf_s <- confusionMatrix(p_s,testing$set)
+
+# create a summary data.frame for plotting
+confusion_matrix_summary <- data.frame(randomForest=c(cf_rF$overall, cf_rF$byClass),
+                                       glm=c(cf_l$overall, cf_l$byClass),
+                                       boost=c(cf_b$overall, cf_b$byClass),
+                                       tree=c(cf_t$overall, cf_t$byClass),
+                                       svm=c(cf_s$overall, cf_s$byClass))
+
+
+confusion_matrix_summary <- as.data.frame(t(confusion_matrix_summary))
+confusion_matrix_summary$model <- paste0(rownames(confusion_matrix_summary), "_base")
+
+
+# Check out accuracy for each model
+ggplot(confusion_matrix_summary, aes(x=model, y=Accuracy)) + geom_point()
+```
+
+So it looks like our 'best' model is a 'gbm' (boost_base), however because this model has built in feature selection (as do 'rpart' and 'rf'), we can't discount our non-feature selected models just yet.
+
+#### Part 2: Feature Selection
+Feature seleciton is an important step in training models. Some have it built in (check out the documentation for your model to see if this is the case), and others don't. 
+The support vector machine model doesn't have built in feature selection, so we'll do this step on it to try an improve perofrmance.
+```{r featureSelection, echo=TRUE}
+# do some funky rearranging
+training_part <- training[,-match('set', colnames(training))]
+train_class <- training$set
+# for some reason, feature selection methods like our class to be a numeric factor (YMMV)
+train_class <- gsub("pcRNA", "0", train_class)
+train_class <- gsub("lncRNA", "1", train_class)
+train_class <- as.factor(train_class)
+
+# try subsets of 1,2,3,4,5,10,15, and 20 variables
+subsets <- c(1:5, 10, 15, 20)
+
+# make a new control object for feature selection
+# uses 'rfFuncs' for model testing - you can also use 'lmFuncs' (for linear models)
+ctrl <- rfeControl(functions = rfFuncs,
+                   method = "repeatedcv",
+                   repeats = 3,
+                   verbose = FALSE)
+
+# set our random seed again
+set.seed(2)
+# do recursive feature selection (this can take a while)
+rfProfile <- rfe(training_part, train_class,
+                 sizes = subsets,
+                 metric="Accuracy",
+                 rfeControl = ctrl)
+
+# looks like 20 variables is the 'best'
+rfProfile
+
+# find out the order that recursive feature selection put our variables in
+variable_order <- rfProfile$optVariables
+variable_order
+
+# remove each variable 1 by 1, and see how much this imroves accuracy when we train a SVM
+# NOTE: because we are trying to optimise here, we are using our validation set to get performance estimates.
+confusion_matrix_list <- list()
+for(i in 20:1){
+  keep_vars <- c(variable_order[1:i], 'set')
+  svmModel_feats <- train(set ~ ., 
+                  data=training[,keep_vars], 
+                  method="svmRadial",
+                  trControl = fitControl)
+  
+  p_s <- predict(svmModel_feats, validate)
+  confusion_matrix_list[[i]] <- confusionMatrix(p_s,validate$set)
+}
+
+accuracy_removeVars <- (unlist(lapply(confusion_matrix_list, function(x) x$overall[1])))
+number_vars <- c(1:20)
+plot(number_vars, accuracy_removeVars)
+```
+
+Now that we know what features are important for the best accuracy, let's train a new model using only these features.
+```{r}
+# train a svm model with the 'best' features
+keep_vars <- c(variable_order[1:which.max(accuracy_removeVars)], 'set')
+
+svmModel_feats <- train(set ~ ., 
+                        data=training[,keep_vars], 
+                        method="svmRadial",
+                        trControl = fitControl)
+
+p_s <- predict(svmModel_feats, testing)
+cf_sFeats <- confusionMatrix(p_s,testing$set)
+# compare the old model (no feature selection) to the new model
+cf_s # old
+cf_sFeats # new
+
+# compare to all the previous models
+newLine <- as.data.frame(t(data.frame(svm_featureSelection=c(cf_sFeats$overall, cf_sFeats$byClass))))
+newLine$model <- "svm_featureSelection"
+confusion_matrix_summary <- rbind(confusion_matrix_summary, newLine)
+# now SVM has comparible performance to other models
+ggplot(confusion_matrix_summary, aes(x=model, y=Accuracy)) + geom_point()
+
+```
+
+#### Part 3: Grid searches
+Grid searches can be used for optimising hyperparameters in a model. 
+We'll be doing a (small) grid search for the hyperparamters (C/cost and sigma) in our SVM model.
+```{r, echo=TRUE}
+# create a grid of values to test with 
+# (I've kept it small to save time)
+svmGrid <-  expand.grid(C=c(0.25,0.50,1,2,4), 
+                        sigma = c(1, 1000))
+
+svmModel_grid_featSel <- train(set ~ ., 
+                         data=training[,keep_vars], 
+                         method="svmRadial",
+                         trControl = fitControl,
+                         verbose=TRUE,
+                         tuneGrid=svmGrid)
+
+plot(svmModel_grid_featSel)
+
+grid_search_results <- svmModel_grid_featSel$results
+grid_search_results[which.max(grid_search_results$Accuracy),]
+```
+Now that we know the optimal hyperparameters, lets train our model with them.
+```{r}
+# train a model with optimal hyperparameters
+
+svmModel_grid_featSel <- train(set ~ ., 
+                         data=training[,keep_vars], 
+                         method="svmRadial",
+                         trControl = fitControl,
+                         verbose=TRUE,
+                         tuneGrid=svmGrid[which.max(grid_search_results$Accuracy),-3])
+
+p_s <- predict(svmModel_grid_featSel, testing)
+cf_sGrid <- confusionMatrix(p_s,testing$set)
+# compare the old model (with feature selection) to the new model
+cf_sFeats # old
+cf_sGrid # new
+
+# compare to all the previous models
+newLine <- as.data.frame(t(data.frame(svm_Grid=c(cf_sGrid$overall, cf_sGrid$byClass))))
+newLine$model <- "svm_Grid"
+confusion_matrix_summary <- rbind(confusion_matrix_summary, newLine)
+# not a huge jump in accuracy, as the original model hyperparameters were pretty close to the optimal ones already
+ggplot(confusion_matrix_summary, aes(x=model, y=Accuracy)) + geom_point()
+
+```
+
+### Working with unbalanced data
+When applying ML to genetics problems, we often are working with unbalanced datasets. 
+We'll use the same lncRNA / pcRNA dataset, but now at a 1:6 ratio to test out some methods that can be useful.
+
+#### Step 1. Set up an unbalanced dataset {.tabset}
+```{r, echo=TRUE}
+# get indicies for unbalanced datasets (at a 1:6 ratio for testing and validation)
+# 500:3000 for testing and validation
+# remainder of pcRNA in training
+# still using the same order as before, so there shouldn't be any cross contamination
+inTrain <- c(random_order_pcRNA[1:1000], random_order_lncRNA[1:1000], random_order_pcRNA[7000:length(random_order_pcRNA)])
+inValidate <- c(random_order_pcRNA[1001:2000], random_order_lncRNA[1001:1500], random_order_pcRNA[3001:5000])
+inTest <- c(random_order_pcRNA[2001:3000], random_order_lncRNA[2001:2500], random_order_pcRNA[5001:7000])
+```
+
+#### Step 2. Preprocess
+Same steps as when we were processing the balanced dataset.
+```{r, echo=TRUE}
+# split our numeric data
+training <- all_data_numeric[inTrain,]
+validate <- all_data_numeric[inValidate,]
+testing <- all_data_numeric[inTest,]
+
+# center and scale each dataset by the training values
+preProcessValues <- preProcess(training, method=c("center", "scale"))
+training <- predict(preProcessValues, training)
+validate <- predict(preProcessValues, validate)
+testing <- predict(preProcessValues, testing)
+
+# add classes
+train_class <- lncRNAandpcRNA$set[inTrain]
+validate_class <- lncRNAandpcRNA$set[inValidate]
+test_class <- lncRNAandpcRNA$set[inTest]
+
+training <- cbind(as.data.frame(training), set=train_class)
+validate <- cbind(as.data.frame(validate), set=validate_class)
+testing <- cbind(as.data.frame(testing), set=test_class)
+```
+
+#### Step 3. Model Training
+
+**Part 1. The base model**
+
+First, let's build a model with the same ratio of lncRNA:pcRNA as we are iusing in the testing dataset.
+We're going to be training 'gbm' models as they're a bit faster to train, and don't require feature selection.
+```{r, echo=TRUE}
+# we're using a small subset of the data here (200/1000 lncRNAs) to speed up how fast this runs.
+# NOTE: if you're using random subsets, remember to replicate models and take the average performance to compare to other models.
+set.seed(3)
+train_index_1 <- sample(which(training$set == "lncRNA"), 200)
+train_index_2 <- sample(which(training$set == "pcRNA"), 200*6)
+  
+training_part <- training[(c(train_index_1, train_index_2)),]
+  
+# we're using a gradient boosting machine algorithm this time
+# it has built in feature selection, so we dont need to worry about that step
+# and it runs pretty fast
+boostModel_unbalanced <- train(set ~ ., 
+                      data=training_part, 
+                      method="gbm",
+                      verbose=FALSE,
+                      trControl = fitControl)
+
+p_b_unbal <- predict(boostModel_unbalanced, testing)
+conf_unbal <- confusionMatrix(p_b_unbal, testing$set)  
+# our model has fairly high specificity, positive predictive value, negative predictive value, and accuracy
+# but low sensitivity (we're incorrectly classing a lot of our lncRNAs as protein coding)
+conf_unbal
+# our F1 is also not great in comparison to the rest of our metrics
+conf_unbal$byClass['F1']
+```
+
+**Part 2. Adding weights**
+
+Weights can be added to each example in our training dataset to determine how heavily it should be weighted during the process of training.
+```{r, echo=TRUE}
+# add weights to each training instance
+model_weights <- ifelse(training_part$set == "lncRNA",
+                       (1/table(training_part$set)[1]) * 0.5,
+                       (1/table(training_part$set)[2]) * 0.5)
+
+# lncRNAs have higher weights than pcRNA
+table(model_weights, training_part$set)
+
+boostModel_weights <- train(set ~ ., 
+                          data=training_part, 
+                          method="gbm",
+                          weights=model_weights,
+                          verbose=FALSE,
+                          trControl = fitControl)
+
+p_b_weights <- predict(boostModel_weights, testing)
+conf_weights <- confusionMatrix(p_b_weights, testing$set)  
+
+# now we're moving in the right direction!
+# our weighted model has much better sensitivity
+conf_weights
+
+conf_unbal
+
+conf_weights$byClass['F1']
+
+```
+
+**Part 3. Under and Over-sampling**
+
+We can also use under and oversampling to determine the best ratio that our data should be in for training.
+Often, this is not the same ratio as the testing dataset.
+```{r, echo=TRUE}
+# use ratios of 1:1, 1:3, 1:6, and 1:9
+# repeat 5 times so we get a bit of a feel for variability
+set.seed(5)
+training_ratio <- rep(c(1,3,6,9), each=5)
+
+confusion_matrix_list_ratio <- list()
+
+for(t in 1:length(training_ratio)){
+  fact <- training_ratio[t]
+  
+  train_index_1 <- sample(which(training$set == "lncRNA"), 200)
+  train_index_2 <- sample(which(training$set == "pcRNA"), 200*fact)
+  
+  training_part <- training[(c(train_index_1, train_index_2)),]
+  
+  boostModel_ratio <- train(set ~ ., 
+                      data=training_part, 
+                      method="gbm",
+                      verbose=FALSE,
+                      trControl = fitControl)
+  
+  p_b <- predict(boostModel_ratio, validate)
+  confusion_matrix_list_ratio[[t]] <- confusionMatrix(p_b,validate$set)
+}
+
+ratio_df <- data.frame(ratio=training_ratio,
+                       Accuracy=(unlist(lapply(confusion_matrix_list_ratio, function(x) x$overall[1]))),
+                       F1=(unlist(lapply(confusion_matrix_list_ratio, function(x) x$byClass['F1']))))
+
+# peak F1 at a 3:1 ratio
+ggplot(ratio_df, aes(x=ratio, y=F1)) + geom_point()
+```
+
+Now create a model using the optimal training ratio
+
+```{r}
+mean_F1 <- aggregate(F1 ~ ratio, ratio_df, mean)
+best_ratio <- mean_F1$ratio[which.max(mean_F1$F1)]
+
+train_index_1 <- sample(which(training$set == "lncRNA"), 500)
+train_index_2 <- sample(which(training$set == "pcRNA"), 500*best_ratio)
+  
+training_part <- training[(c(train_index_1, train_index_2)),]
+  
+boostModel_ratio <- train(set ~ ., 
+                      data=training_part, 
+                      method="gbm",
+                      verbose=FALSE,
+                      trControl = fitControl)
+  
+p_b <- predict(boostModel_ratio, testing)
+
+conf_ratio <- confusionMatrix(p_b,testing$set)
+
+conf_ratio # with best ratio
+conf_unbal$byClass['F1'] # same test/train ratio
+conf_ratio$byClass['F1'] # best ratio
+```
+
+
+#### Performance metrics for unbalanced classes
+
+You may want to use a metric other than accuracy to evaluate how well your classifier works on an unbalanced dataset.
+
+Reciever Operator Characteristic (ROC) curves are independant of test set balancing
+```{r}
+# at 6:1 ratio
+prob_b <- predict(boostModel_ratio, testing, "prob")
+roc.6 <- roc.curve(scores.class0 = prob_b[testing$set=="pcRNA",2],
+                   scores.class1 = prob_b[testing$set=="lncRNA",2], curve=TRUE)
+plot(roc.6)
+# at 1:1 ratio
+roc.1 <- roc.curve(scores.class0 = prob_b[testing$set=="pcRNA",2][sample(1:3000, 500)],
+                   scores.class1 = prob_b[testing$set=="lncRNA",2], curve=TRUE)
+plot(roc.1)
+```
+
+While Precision Recall curves can be useful for understanding how well your model performs on positive data, they are not independant of test dataset ratio composition.
+```{r}
+# at 6:1 ratio
+pr.6 <- pr.curve(scores.class0 = prob_b[testing$set=="pcRNA",2],
+                   scores.class1 = prob_b[testing$set=="lncRNA",2], curve=TRUE)
+plot(pr.6)
+# at 1:1 ratio
+pr.1 <- pr.curve(scores.class0 = prob_b[testing$set=="pcRNA",2][sample(1:3000, 500)],
+                   scores.class1 = prob_b[testing$set=="lncRNA",2], curve=TRUE)
+plot(pr.1)
+```
+
+
+### Feature Importance
+
+Often we want to know why a model works, and with more complex algorithms this can be quite difficult.
+If we're using simple models, we can often take a look at the decisions the model is making.
+
+For a tree-based model, we can just plot it:
+```{r}
+library(rpart.plot)
+# remember that our variables are sentered and scaled
+rpart.plot(treeModel$finalModel)
+```
+
+Knowing what features are heavily contributing to model predictions can give us some insight when using more complex models.
+
+```{r}
+varImp(boostModel)
+```
+
+In the case of the boosted model, ORF length is the top feature for classifying datapoints.
+This makes sense as protein coding transcripts tend to have long open reading frames, wheras lncRNAs tend not to.
+
+We can also see that some of the random features (random_X and random_Y) are more important than some of the real features, which can give us an idnication that they might not be very important for model performance. 
+I've incuded these to show that variable importance is not bulletproof.
+
+**Leave-one-out model training**
+
+We can also retrain models without each variable to see which variables have a large impact on model performance
+```{r}
+all_data_numeric <- predict(dummies, newdata = lncRNAandpcRNA)
+
+# remove correlated variables
+variable_correlations <- cor(all_data_numeric)
+all_data_numeric <- all_data_numeric[,-highly_correlated]
+
+# get indicies for balanced datasets (2000 in each set, at a 1:1 ratio)
+inTrain <- c(random_order_pcRNA[1:1000], random_order_lncRNA[1:1000])
+inTest <- c(random_order_pcRNA[2001:3000], random_order_lncRNA[2001:3000])
+
+# split our numeric data
+training <- all_data_numeric[inTrain,]
+testing <- all_data_numeric[inTest,]
+
+preProcessValues <- preProcess(training, method=c("center", "scale"))
+training <- predict(preProcessValues, training)
+testing <- predict(preProcessValues, testing)
+
+# add classes
+train_class <- lncRNAandpcRNA$set[inTrain]
+test_class <- lncRNAandpcRNA$set[inTest]
+
+training <- cbind(as.data.frame(training), set=train_class)
+testing <- cbind(as.data.frame(testing), set=test_class)
+
+# get a vector of all or training variables
+variables <- colnames(training)
+variables <- variables[-which(variables=="set")]
+
+confusion_matrix_list_L10 <- list()
+for(var in seq_along(variables)){
+  rm <- which(colnames(training) == variables[var])
+  
+  boostModel_L1O <- train(set ~ ., 
+                     data=training[,-rm], 
+                     method="gbm",
+                     verbose=FALSE, # be quiet
+                     trControl = fitControl)
+  
+  p_L10 <- predict(boostModel_L1O, testing[,-rm])
+  confusion_matrix_list_L10[[var]] <- confusionMatrix(p_L10, testing$set)
+}
+
+confusion_matrix_summary_L1O <- data.frame(variable_rm = variables,
+                                           accuracy=unlist(lapply(confusion_matrix_list_L10, function(x) x$overall['Accuracy'])),
+                                           F1=unlist(lapply(confusion_matrix_list_L10, function(x) x$byClass['F1']))
+                                           )
+confusion_matrix_summary_L1O$accuracy_change <- cf_b$overall['Accuracy'] - confusion_matrix_summary_L1O$accuracy
+confusion_matrix_summary_L1O$F1_change <- cf_b$byClass['F1'] - confusion_matrix_summary_L1O$F1
+
+# Check out accuracy change for each model
+ggplot(confusion_matrix_summary_L1O, aes(x=variable_rm, y=accuracy_change)) + 
+  geom_bar(stat="identity") + theme(axis.text.x=element_text(angle=90,hjust=1))
+
+# Check out F1 change for each model
+ggplot(confusion_matrix_summary_L1O, aes(x=variable_rm, y=F1_change)) + 
+  geom_bar(stat="identity") + theme(axis.text.x=element_text(angle=90,hjust=1))
+```
+
+In most cases, the change in accuracy and F1 is not very big, but there are a few variables where removal actually increases model accuracy. For these, it's unlikely that they are important for predictions.
+
+
+
+
+
+
+
+
+
+
